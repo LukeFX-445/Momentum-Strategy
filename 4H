@@ -1,0 +1,554 @@
+"""
+omor_4h_system.py
+=================
+Pair-agnostic replication of the Omor 4H Sweep Entry Framework.
+
+SYSTEM RULES (as described)
+----------------------------
+Signal fires on bar i, entry at open of bar i+1.
+
+LONG conditions (all must be true on bar i):
+  1. Sweep:        low[i]  < low[i-1]                              (swept prior low)
+  2. Close 70%:    close   >= ((high - low) * 0.70) + low          (bullish close)
+  3. MA200 bias:   close   > MA(200) × 0.995                       (soft — within 0.5% below allowed)
+  4. MA50 tap:     close   > MA(50)                                 (recovered above MA50)
+  5. ADX:          ADX(14) > threshold                              (trending, not ranging)
+
+SHORT conditions (mirror of long):
+  1. Sweep:        high[i] > high[i-1]
+  2. Close 70%:    close   <= high - ((high - low) * 0.70)
+  3. MA200 bias:   close   < MA(200) × 1.005                       (soft — within 0.5% above allowed)
+  4. MA50 tap:     close   < MA(50)
+  5. ADX:          ADX(14) > threshold
+
+Removed as over-filters (kept as diagnostic columns only):
+  - MA50 dist:   abs(low/high − MA50) <= ATR(14)   — redundant; rejects large sweep candles
+  - ADR cap:     (high − low) <= 0.75 × ADR(5)     — specifically rejects the core sweep setup
+
+Trade execution:
+  Entry  = open[i+1]
+  SL     = low[i]  (long) | high[i] (short)
+  TP     = entry + (entry - SL) * 1.9   (long)
+           entry - (SL - entry) * 1.9   (short)
+
+OANDA London 4H sessions only: 02:00, 06:00, 10:00, 14:00, 18:00
+Overnight candle (22:00) excluded due to low volatility.
+
+USAGE
+-----
+  from omor_4h_system import build_4h_candles, generate_signals, backtest
+
+  # Start from 1H OHLCV data (UTC-aware DatetimeIndex)
+  df_4h    = build_4h_candles(df_1h)
+  df_sig   = generate_signals(df_4h)
+  trades, summary = backtest(df_4h)
+  print(summary)
+"""
+
+import pandas as pd
+import numpy as np
+from typing import Optional
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEFAULT PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+PARAMS = dict(
+    ma_fast           = 50,                        # Fast MA (MA50)
+    ma_slow           = 200,                       # Slow MA (MA200)
+    atr_period        = 14,                        # ATR period
+    adx_period        = 14,                        # ADX smoothing period
+    adx_threshold     = 20.0,                      # Min ADX to confirm trend
+    adr_period        = 5,                         # Daily ADR lookback (trading days)
+    adr_cap_pct       = 0.75,                      # Max 4H range as fraction of ADR
+    close_pct         = 0.70,                      # 70% close rule threshold
+    sl_buffer         = 0.0,                       # SL buffer as fraction of ATR14 (0 = no buffer)
+    rr                = 2.1,                       # Default RR — overridden per instrument below
+    max_candle_filter = None,                      # Reject signal if range > N × avg_range_5 (None = disabled)
+    min_candle_filter = None,                      # Reject signal if range < N × avg_range_5 (None = disabled)
+    london_tz         = 'Europe/London',
+    valid_hours       = frozenset({2, 6, 10, 14, 18}),  # OANDA London session opens
+)
+
+# Per-instrument parameters — walk-forward validated (IS: Dec 2020–Dec 2023, OOS: Jan 2024–Jun 2026).
+# Gold confirmed at RR=1.9 (OOS exp 0.2516 vs 0.2333 at RR=2.1; passed all 3 OOS criteria).
+# All other instruments confirmed at RR=2.1. sl_buffer=0.0 locked for all.
+#
+# max_candle_filter: reject if candle range > N × avg_range_5 (oversized sweep — SL too wide).
+#   DAX  1.00 — IS DD -23.60→-14.70 (+8.90R); OOS DD -13.80→-8.70, exp 0.234→0.439 (PASS).
+#   Oil  2.00 — IS DD -14.00→-9.90  (+4.10R); OOS DD -18.40→-18.30, exp 0.075→0.068 (PASS).
+#
+# min_candle_filter: reject if candle range < N × avg_range_5 (undersized sweep — lacks momentum).
+#   SP500  0.75 — IS DD -19.70→-13.00 (+6.70R); OOS DD -18.90→-10.90, exp 0.124→0.171 (PASS).
+#   Silver 0.75 — IS DD -15.80→-15.30 (+0.50R); OOS DD -20.80→-15.30, exp 0.121→0.196 (PASS).
+INSTRUMENT_PARAMS = {
+    'DAX':    {'rr': 2.1, 'adx_threshold': 15, 'max_candle_filter': 1.00, 'min_candle_filter': None},
+    'Gold':   {'rr': 1.9, 'adx_threshold': 15, 'max_candle_filter': None, 'min_candle_filter': None},
+    'SP500':  {'rr': 2.1, 'adx_threshold': 15, 'max_candle_filter': None, 'min_candle_filter': 0.75},
+    'Nikkei': {'rr': 2.1, 'adx_threshold': 25, 'max_candle_filter': None, 'min_candle_filter': None},
+    'Oil':    {'rr': 2.1, 'adx_threshold': 15, 'max_candle_filter': 2.00, 'min_candle_filter': None},
+    'Silver': {'rr': 2.1, 'adx_threshold': 20, 'max_candle_filter': None, 'min_candle_filter': 0.75},
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INDICATOR CALCULATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _wilder(series: pd.Series, period: int) -> pd.Series:
+    """
+    Wilder's smoothed moving average (RMA).
+    Equivalent to Pine Script's ta.rma() — used for ATR and ADX.
+    """
+    return series.ewm(alpha=1.0 / period, adjust=False).mean()
+
+
+def calc_atr(high: pd.Series, low: pd.Series, close: pd.Series,
+             period: int = 14) -> pd.Series:
+    """14-period ATR using Wilder smoothing."""
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    return _wilder(tr, period)
+
+
+def calc_adx(high: pd.Series, low: pd.Series, close: pd.Series,
+             period: int = 14) -> pd.Series:
+    """
+    ADX using Wilder smoothing.
+    Returns the ADX line only (directional strength, not direction).
+    """
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+
+    up   = high.diff()
+    dn   = -low.diff()
+
+    plus_dm  = pd.Series(np.where((up > dn)  & (up > 0),  up, 0.0), index=high.index)
+    minus_dm = pd.Series(np.where((dn > up)  & (dn > 0),  dn, 0.0), index=high.index)
+
+    atr_s    = _wilder(tr, period)
+    plus_di  = 100 * _wilder(plus_dm,  period) / atr_s
+    minus_di = 100 * _wilder(minus_dm, period) / atr_s
+
+    denom = (plus_di + minus_di).replace(0, np.nan)
+    dx    = 100 * (plus_di - minus_di).abs() / denom
+    adx   = _wilder(dx.fillna(0), period)
+    return adx
+
+
+def calc_adr(high: pd.Series, low: pd.Series, period: int = 5) -> pd.Series:
+    """
+    5-day Average Daily Range, forward-filled onto 4H bar index.
+    Computed by resampling 4H highs/lows to daily, then rolling mean.
+    """
+    daily_hi  = high.resample('1D').max()
+    daily_lo  = low.resample('1D').min()
+    daily_rng = (daily_hi - daily_lo).rolling(period).mean()
+    # Forward-fill daily value onto every 4H bar in that day
+    return daily_rng.reindex(high.index, method='ffill')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OANDA 4H CANDLE BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_4h_candles(
+    df_1h: pd.DataFrame,
+    london_tz: str = 'Europe/London',
+    valid_hours: frozenset = frozenset({2, 6, 10, 14, 18}),
+    drop_empty_bars: bool = True,
+    use_session_filter: bool = True,
+    resample_offset: str = '0h',
+) -> pd.DataFrame:
+    """
+    Resample 1H OHLCV data into OANDA-style 4H candles.
+
+    Parameters
+    ----------
+    df_1h              : DataFrame with columns [open, high, low, close] (+ optional volume).
+                         Index must be a UTC-aware DatetimeIndex.
+    london_tz          : Timezone string for conversion (default 'Europe/London').
+    valid_hours        : Set of London-time hours that define valid session opens.
+    drop_empty_bars    : If True (default), drop candles where high == low or
+                         volume == 0 (when volume is present). Removes hollow
+                         overnight/weekend bars produced for market-hours instruments.
+    use_session_filter : If True (default), apply OANDA London session logic —
+                         resample anchored at 02:00 London and keep only candles
+                         at valid_hours (drops the 22:00 overnight candle).
+                         Set False for CFD/Yahoo data that trades 24/5 continuously;
+                         bars are then anchored at midnight UTC with no hour filter.
+    resample_offset    : UTC offset for 4H bar anchor when use_session_filter=False.
+                         '0h'  → Anchor A: bars at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00
+                         '2h'  → Anchor B: bars at 02:00, 06:00, 10:00, 14:00, 18:00, 22:00
+                         Ignored when use_session_filter=True (London offset applies).
+
+    Returns
+    -------
+    DataFrame of 4H candles.
+    """
+    df = df_1h.copy()
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC')
+
+    agg_rules = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}
+
+    if use_session_filter:
+        # Convert to London time so session hours align correctly
+        df_target = df.copy()
+        df_target.index = df_target.index.tz_convert(london_tz)
+        if 'volume' in df_target.columns:
+            agg_rules['volume'] = 'sum'
+        candles = (
+            df_target
+            .resample('4h', offset='2h')
+            .agg(agg_rules)
+            .dropna(subset=['open'])
+        )
+        # Keep only candles opening at valid London hours (drops the 22:00 candle)
+        candles = candles[candles.index.hour.isin(valid_hours)]
+    else:
+        # Standard 4H bars anchored at midnight UTC, no hour filtering.
+        # resample_offset shifts the anchor: '0h' = midnight, '2h' = 02:00 UTC.
+        if 'volume' in df.columns:
+            agg_rules['volume'] = 'sum'
+        candles = (
+            df
+            .resample('4h', offset=resample_offset)
+            .agg(agg_rules)
+            .dropna(subset=['open'])
+        )
+
+    # Drop empty bars: flat candles and zero-volume bars from market-hours gaps.
+    # Volume filter is skipped when all values are zero (price indices like ^FTSE
+    # carry no meaningful volume from Yahoo Finance).
+    if drop_empty_bars:
+        candles = candles[candles['high'] != candles['low']]
+        if 'volume' in candles.columns and (candles['volume'] > 0).any():
+            candles = candles[candles['volume'] > 0]
+
+    return candles
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL GENERATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_signals(df: pd.DataFrame, params: Optional[dict] = None) -> pd.DataFrame:
+    """
+    Apply all Omor 4H sweep conditions to a candle DataFrame.
+    
+    Returns the original DataFrame with the following columns appended:
+
+    Indicators:
+      ma50, ma200       — simple moving averages
+      atr14             — 14-period ATR (Wilder)
+      adx14             — 14-period ADX
+      adr5              — 5-day Average Daily Range (forward-filled)
+
+    Condition flags (all boolean):
+      c_sweep_low       — low[i] < low[i-1]
+      c_sweep_high      — high[i] > high[i-1]
+      c_close70_bull    — close >= ((H-L)*0.70)+L
+      c_close70_bear    — close <= H - ((H-L)*0.70)
+      c_above_ma200     — close > MA200 × 0.995  (soft bias: 0.5% below still passes)
+      c_below_ma200     — close < MA200 × 1.005  (soft bias: 0.5% above still passes)
+      c_ma50_tap_long   — close > MA50
+      c_ma50_tap_short  — close < MA50
+      c_ma50_dist_long  — abs(low - MA50) <= ATR14   (diagnostic only, not used in signal)
+      c_ma50_dist_short — abs(high - MA50) <= ATR14  (diagnostic only, not used in signal)
+      c_adx_ok          — ADX > threshold
+      c_adr_ok          — 4H range <= 0.75 × ADR5    (diagnostic only, not used in signal)
+
+    Signals:
+      long_signal       — all long conditions met
+      short_signal      — all short conditions met
+    """
+    p = {**PARAMS, **(params or {})}
+    d = df.copy()
+
+    # ── Indicators ────────────────────────────────────────────────────────────
+    d['ma50']  = d['close'].rolling(p['ma_fast']).mean()
+    d['ma200'] = d['close'].rolling(p['ma_slow']).mean()
+    d['atr14'] = calc_atr(d['high'], d['low'], d['close'], p['atr_period'])
+    d['adx14'] = calc_adx(d['high'], d['low'], d['close'], p['adx_period'])
+    d['adr5']  = calc_adr(d['high'], d['low'], p['adr_period'])
+
+    candle_range = d['high'] - d['low']
+    d['avg_range_5'] = candle_range.rolling(5).mean()
+
+    # ── 1. Sweep ──────────────────────────────────────────────────────────────
+    d['c_sweep_low']  = d['low']  < d['low'].shift(1)
+    d['c_sweep_high'] = d['high'] > d['high'].shift(1)
+
+    # ── 2. 70% close rule ─────────────────────────────────────────────────────
+    # Long:  close must be in the upper 30% of the candle
+    # Short: close must be in the lower 30% of the candle
+    d['c_close70_bull'] = d['close'] >= (candle_range * p['close_pct']) + d['low']
+    d['c_close70_bear'] = d['close'] <= d['high'] - (candle_range * p['close_pct'])
+
+    # ── 3. MA200 soft bias ────────────────────────────────────────────────────
+    # Allow signals within 0.5% of MA200 rather than hard-rejecting at the line.
+    d['c_above_ma200'] = d['close'] > d['ma200'] * 0.995
+    d['c_below_ma200'] = d['close'] < d['ma200'] * 1.005
+
+    # ── 4. MA50 tap ───────────────────────────────────────────────────────────
+    # Close must have recovered to the correct side of MA50.
+    d['c_ma50_tap_long']   = d['close'] > d['ma50']
+    d['c_ma50_tap_short']  = d['close'] < d['ma50']
+
+    # ── MA50 distance (diagnostic only — not used in signal) ─────────────────
+    d['c_ma50_dist_long']  = (d['ma50'] - d['low']).abs()  <= d['atr14']
+    d['c_ma50_dist_short'] = (d['high'] - d['ma50']).abs() <= d['atr14']
+
+    # ── 5. ADX trend filter ───────────────────────────────────────────────────
+    d['c_adx_ok'] = d['adx14'] > p['adx_threshold']
+
+    # ── ADR overextension (diagnostic only — not used in signal) ─────────────
+    # Kept for inspection; removed as a filter because it specifically rejects
+    # large sweep candles that are the core of this setup.
+    d['c_adr_ok'] = candle_range <= (d['adr5'] * p['adr_cap_pct'])
+
+    # ── Candle size filters ───────────────────────────────────────────────────
+    # max: rejects oversized sweep candles where the SL distance is too wide.
+    # min: rejects undersized sweep candles that lack momentum.
+    max_csf = p.get('max_candle_filter', None)
+    min_csf = p.get('min_candle_filter', None)
+
+    c_candle_max_ok = (
+        candle_range <= max_csf * d['avg_range_5']
+        if max_csf is not None
+        else pd.Series(True, index=d.index)
+    )
+    c_candle_min_ok = (
+        candle_range >= min_csf * d['avg_range_5']
+        if min_csf is not None
+        else pd.Series(True, index=d.index)
+    )
+
+    # ── Combined signals ──────────────────────────────────────────────────────
+    d['long_signal'] = (
+        d['c_sweep_low']     &
+        d['c_close70_bull']  &
+        d['c_above_ma200']   &
+        d['c_ma50_tap_long'] &
+        d['c_adx_ok']        &
+        c_candle_max_ok      &
+        c_candle_min_ok
+    )
+
+    d['short_signal'] = (
+        d['c_sweep_high']      &
+        d['c_close70_bear']    &
+        d['c_below_ma200']     &
+        d['c_ma50_tap_short']  &
+        d['c_adx_ok']          &
+        c_candle_max_ok        &
+        c_candle_min_ok
+    )
+
+    return d
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKTESTER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def backtest(
+    df: pd.DataFrame,
+    params: Optional[dict] = None,
+    verbose: bool = False
+):
+    """
+    Bar-by-bar backtest of the Omor 4H sweep system.
+
+    Trade logic:
+      - Signal fires on bar i
+      - Entry at open of bar i+1
+      - SL at low[i] (long) or high[i] (short)
+      - TP at entry ± risk * RR
+      - One trade at a time; no pyramiding
+
+    Parameters
+    ----------
+    df      : DataFrame of 4H candles (output of build_4h_candles).
+    params  : Override any PARAMS values.
+    verbose : Print each trade entry to console.
+
+    Returns
+    -------
+    trades_df : DataFrame with one row per trade.
+    summary   : Dict of performance metrics.
+    """
+    p = {**PARAMS, **(params or {})}
+    rr = p['rr']
+
+    d = generate_signals(df, p)
+
+    trades     = []
+    in_trade   = False
+    direction  = None
+    entry = sl = tp = None
+
+    for i in range(1, len(d)):
+        row  = d.iloc[i]
+        prev = d.iloc[i - 1]
+
+        # ── Manage open trade ─────────────────────────────────────────────────
+        if in_trade:
+            hi, lo = row['high'], row['low']
+
+            if direction == 'LONG':
+                if lo <= sl:
+                    trades[-1].update(exit_price=sl, result='LOSS',
+                                      pnl_r=-1.0, exit_time=row.name)
+                    in_trade = False
+                elif hi >= tp:
+                    trades[-1].update(exit_price=tp, result='WIN',
+                                      pnl_r=rr, exit_time=row.name)
+                    in_trade = False
+
+            else:  # SHORT
+                if hi >= sl:
+                    trades[-1].update(exit_price=sl, result='LOSS',
+                                      pnl_r=-1.0, exit_time=row.name)
+                    in_trade = False
+                elif lo <= tp:
+                    trades[-1].update(exit_price=tp, result='WIN',
+                                      pnl_r=rr, exit_time=row.name)
+                    in_trade = False
+            continue  # don't look for new entries while in a trade
+
+        # ── New LONG entry ────────────────────────────────────────────────────
+        if prev['long_signal']:
+            entry = row['open']
+            sl    = prev['low'] - p.get('sl_buffer', 0.0) * prev['atr14']
+            if entry <= sl:    # adverse gap — signal invalidated
+                continue
+            tp        = entry + (entry - sl) * rr
+            direction = 'LONG'
+            in_trade  = True
+            trades.append({
+                'entry_time': row.name,   'direction': 'LONG',
+                'entry':      entry,      'sl':        sl,
+                'tp':         tp,         'exit_price': None,
+                'result':     None,       'pnl_r':     None,
+                'exit_time':  None,
+            })
+            if verbose:
+                print(f"[LONG]  {row.name}  entry={entry:.5f}  sl={sl:.5f}  tp={tp:.5f}")
+
+        # ── New SHORT entry ───────────────────────────────────────────────────
+        elif prev['short_signal']:
+            entry = row['open']
+            sl    = prev['high'] + p.get('sl_buffer', 0.0) * prev['atr14']
+            if entry >= sl:    # adverse gap — signal invalidated
+                continue
+            tp        = entry - (sl - entry) * rr
+            direction = 'SHORT'
+            in_trade  = True
+            trades.append({
+                'entry_time': row.name,   'direction': 'SHORT',
+                'entry':      entry,      'sl':        sl,
+                'tp':         tp,         'exit_price': None,
+                'result':     None,       'pnl_r':     None,
+                'exit_time':  None,
+            })
+            if verbose:
+                print(f"[SHORT] {row.name}  entry={entry:.5f}  sl={sl:.5f}  tp={tp:.5f}")
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    trades_df = pd.DataFrame(trades)
+
+    if trades_df.empty:
+        print("No trades generated.")
+        return trades_df, {}
+
+    closed   = trades_df.dropna(subset=['result'])
+    wins     = int((closed['result'] == 'WIN').sum())
+    losses   = int((closed['result'] == 'LOSS').sum())
+    total    = len(closed)
+    wr       = wins / total if total else 0.0
+    total_r  = round(closed['pnl_r'].sum(), 2)
+    avg_r    = round(closed['pnl_r'].mean(), 3)
+    # Expectancy per trade: (WR × avg_win) + (LR × avg_loss)
+    # With fixed RR: E = WR*RR - (1-WR)*1
+    expectancy = round(wr * rr - (1 - wr), 3)
+
+    # Breakdown by direction
+    long_closed  = closed[closed['direction'] == 'LONG']
+    short_closed = closed[closed['direction'] == 'SHORT']
+
+    summary = {
+        'total_signals':        len(trades_df),
+        'closed_trades':        total,
+        'open_at_end':          len(trades_df) - total,
+        'wins':                 wins,
+        'losses':               losses,
+        'win_rate_pct':         round(wr * 100, 2),
+        'total_r':              total_r,
+        'avg_r_per_trade':      avg_r,
+        'expectancy_per_trade': expectancy,
+        'rr':                   rr,
+        'long_trades':          len(long_closed),
+        'long_win_rate_pct':    round((long_closed['result'] == 'WIN').mean() * 100, 2)
+                                if len(long_closed) else 0.0,
+        'short_trades':         len(short_closed),
+        'short_win_rate_pct':   round((short_closed['result'] == 'WIN').mean() * 100, 2)
+                                if len(short_closed) else 0.0,
+    }
+
+    return trades_df, summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL INSPECTOR  (for manual review of individual signals)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def inspect_signals(df: pd.DataFrame, params: Optional[dict] = None,
+                    n: int = 10) -> pd.DataFrame:
+    """
+    Return the last n long or short signals with all condition flags visible.
+    Useful for manually validating the logic before committing to a backtest.
+    """
+    d = generate_signals(df, params)
+    condition_cols = [c for c in d.columns if c.startswith('c_') or c in
+                      ('ma50', 'ma200', 'atr14', 'adx14', 'adr5',
+                       'long_signal', 'short_signal')]
+
+    signals = d[(d['long_signal'] | d['short_signal'])]
+    return signals[['open', 'high', 'low', 'close'] + condition_cols].tail(n)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USAGE TEMPLATE
+# ─────────────────────────────────────────────────────────────────────────────
+# 
+#   from omor_4h_system import build_4h_candles, backtest, inspect_signals
+#   import pandas as pd
+#
+#   # 1. Load your 1H data (any pair — must have open/high/low/close columns)
+#   df_1h = pd.read_csv('EURUSD_1H.csv', index_col='datetime', parse_dates=True)
+#   df_1h.index = df_1h.index.tz_localize('UTC')   # ensure UTC-aware
+#
+#   # 2. Build OANDA-style 4H candles (London sessions only)
+#   df_4h = build_4h_candles(df_1h)
+#
+#   # 3. Run backtest
+#   trades, summary = backtest(df_4h, verbose=True)
+#   print(summary)
+#   trades.to_csv('omor_trades_EURUSD.csv', index=False)
+#
+#   # 4. Inspect recent signals and their conditions
+#   print(inspect_signals(df_4h))
+#
+#   # 5. Override parameters (e.g. test a tighter ADX threshold)
+#   custom = {'adx_threshold': 25, 'rr': 2.0}
+#   trades2, summary2 = backtest(df_4h, params=custom)
+#
+# ─────────────────────────────────────────────────────────────────────────────
