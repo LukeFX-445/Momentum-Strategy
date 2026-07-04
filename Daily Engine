@@ -1,0 +1,122 @@
+"""
+dm_engine.py — a clean DAILY momentum/breakout backtest. This is its OWN system,
+NOT a port of the Omor 4H sweep (none of that intraday machinery exists on daily
+bars). Donchian-breakout trend-following, the canonical daily-momentum primitive:
+
+  ENTRY (signal on a CLOSED daily bar i, FLAT only):
+    long  : close[i] > max(high[i-N .. i-1])         (N-day high breakout)
+    short : close[i] < min(low [i-N .. i-1])         (N-day low breakout)
+    optional trend filter: long only if close[i] > SMA_trend[i-1]; short mirror.
+  FILL : NEXT bar open + cost (cost = cost_atr_frac * ATR, per side).  No same-bar fill.
+  STOP : FIXED at entry = entry -/+ atr_mult * ATR_entry.  risk = atr_mult*ATR_entry.
+         (ATR_entry = Wilder ATR-14 of the PRIOR completed bar -> no lookahead.)
+  EXIT : (a) stop hit intrabar (fills at stop), or
+         (b) opposite Donchian(M=N//2) channel break on close -> fill NEXT open
+             (the turtle trailing exit; lets winners run -> momentum's fat right tail).
+  R    : pnl_pts / risk_pts.  Costs charged both sides in points.
+
+All windows are strictly trailing (`.shift(1)`); signals fire on closed bars only.
+"""
+import numpy as np
+import pandas as pd
+
+
+def _wilder_atr(df, period=14):
+    h, l, c = df["high"], df["low"], df["close"]
+    pc = c.shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def build_features(df, entry_n, trend_win=None, atr_period=14):
+    f = df.copy()
+    f["atr_entry"] = _wilder_atr(f, atr_period).shift(1)          # prior-bar ATR
+    f["hi_break"] = f["high"].rolling(entry_n).max().shift(1)     # prior N-bar high
+    f["lo_break"] = f["low"].rolling(entry_n).min().shift(1)      # prior N-bar low
+    exit_n = max(5, entry_n // 2)
+    f["exit_lo"] = f["low"].rolling(exit_n).min().shift(1)        # long  trailing exit
+    f["exit_hi"] = f["high"].rolling(exit_n).max().shift(1)       # short trailing exit
+    f["trend"] = (f["close"].rolling(trend_win).mean().shift(1)
+                  if trend_win else np.nan)
+    return f
+
+
+def run_momentum(df, entry_n, atr_mult=2.5, trend_win=None,
+                 cost_atr_frac=0.05, allow_long=True, allow_short=True):
+    """Bar-by-bar daily-momentum backtest. Returns a trades DataFrame (one row/trade)."""
+    f = build_features(df, entry_n, trend_win)
+    o = f["open"].values; h = f["high"].values; l = f["low"].values; c = f["close"].values
+    atr = f["atr_entry"].values
+    hib = f["hi_break"].values; lob = f["lo_break"].values
+    exlo = f["exit_lo"].values; exhi = f["exit_hi"].values
+    trend = f["trend"].values
+    use_trend = trend_win is not None
+    idx = f.index
+
+    rows = []
+    pos = 0
+    entry_px = stop_px = risk = ma_atr = np.nan
+    entry_i = None
+    pending = None          # +1/-1 entry to execute at next open
+    pending_exit = False    # channel-break exit to execute at next open
+
+    for i in range(len(f)):
+        # --- execute pending exit at this open ---
+        if pos != 0 and pending_exit:
+            side = pos
+            cost = cost_atr_frac * ma_atr
+            exit_px = o[i] - side * cost
+            _book(rows, idx, entry_i, i, side, entry_px, exit_px, stop_px, risk, "channel")
+            pos = 0; entry_i = None; pending_exit = False
+
+        # --- execute pending entry at this open ---
+        if pending is not None and pos == 0:
+            side = pending
+            a = atr[i]
+            if not np.isnan(a) and a > 0:
+                cost = cost_atr_frac * a
+                entry_px = o[i] + side * cost
+                stop_px = entry_px - side * atr_mult * a
+                risk = abs(entry_px - stop_px)
+                if risk > 0:
+                    pos = side; entry_i = i; ma_atr = a
+            pending = None
+
+        # --- manage an open position (stop is intrabar; channel exit is next-open) ---
+        if pos != 0 and entry_i is not None and i > entry_i:
+            side = pos
+            stopped = (l[i] <= stop_px) if side == 1 else (h[i] >= stop_px)
+            if stopped:
+                cost = cost_atr_frac * ma_atr
+                exit_px = stop_px - side * cost
+                _book(rows, idx, entry_i, i, side, entry_px, exit_px, stop_px, risk, "stop")
+                pos = 0; entry_i = None; pending_exit = False
+            else:
+                # channel-break on close -> arm exit for next open
+                if side == 1 and c[i] < exlo[i]:
+                    pending_exit = True
+                elif side == -1 and c[i] > exhi[i]:
+                    pending_exit = True
+
+        # --- look for a new signal on this closed bar (only if flat & nothing pending) ---
+        if pos == 0 and pending is None:
+            long_ok = allow_long and (not np.isnan(hib[i])) and c[i] > hib[i]
+            short_ok = allow_short and (not np.isnan(lob[i])) and c[i] < lob[i]
+            if use_trend:
+                long_ok = long_ok and (not np.isnan(trend[i])) and c[i] > trend[i]
+                short_ok = short_ok and (not np.isnan(trend[i])) and c[i] < trend[i]
+            if long_ok:
+                pending = 1
+            elif short_ok:
+                pending = -1
+
+    return pd.DataFrame(rows)
+
+
+def _book(rows, idx, ei, xi, side, entry_px, exit_px, stop_px, risk, reason):
+    pnl = side * (exit_px - entry_px)
+    rows.append({
+        "entry_date": idx[ei].normalize(), "exit_date": idx[xi].normalize(),
+        "side": side, "entry_px": entry_px, "exit_px": exit_px,
+        "R": pnl / risk if risk else np.nan, "bars_held": xi - ei, "reason": reason,
+    })
